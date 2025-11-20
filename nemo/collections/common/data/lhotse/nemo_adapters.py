@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import random
 import re
 import tarfile
@@ -331,6 +332,7 @@ class LazyNeMoTarredIterator:
         self.slice_length = slice_length
         self.epoch = 0
         self._validate()
+        self.use_ais_get_batch = os.environ.get("USE_AIS_GET_BATCH", "False").lower() == "true"
 
     def to_shards(self) -> List["LazyNeMoTarredIterator"]:
         """Convert this iterator to a list of separate iterators for each shard."""
@@ -426,29 +428,62 @@ class LazyNeMoTarredIterator:
 
             shard_manifest: dict[str, list[dict]] = groupby(basename, self.shard_id_to_manifest[sid])
             tar_path = self.shard_id_to_tar_path[sid]
-            try:
-                for data, raw_audio, tar_info in self._iter_sequential(tar_path, shard_manifest, manifest_path, rng):
-                    try:
-                        meta = soundfile.info(BytesIO(raw_audio))
-                    except Exception:
-                        logging.warning(f"Skipped corrupted file '{tar_info.path}' in {tar_path=}.")
-                        continue
-                    recording = Recording(
-                        id=tar_info.path,
-                        sources=[AudioSource(type="memory", channels=list(range(meta.channels)), source=raw_audio)],
-                        sampling_rate=int(meta.samplerate),
-                        num_samples=meta.frames,
-                        duration=meta.duration,
-                    )
-                    cuts_for_recording = []
-                    for data in sorted(shard_manifest[tar_info.name], key=lambda d: d["audio_filepath"]):
+            if self.use_ais_get_batch:
+                # Don't open tar file, just prepare URL-based recordings
+                # Calculate slice offset for random skipping
+                total_entries = sum(len(entries) for entries in shard_manifest.values())
+                slice_offset = (
+                    rng.randint(0, total_entries - self.slice_length)
+                    if self.slice_length is not None and self.slice_length < total_entries
+                    else -1
+                )
+                cntr = 0
+                entries_processed = 0
+
+                for audio_filename, manifest_entries in shard_manifest.items():
+                    for data in manifest_entries:
+                        # Skip entries if we haven't reached the slice offset yet
+                        if entries_processed < slice_offset:
+                            entries_processed += 1
+                            continue
+                        # Stop if we've reached the slice length limit
+                        elif cntr == self.slice_length:
+                            break
+
                         # filter out entries with valid "_skipme" values.
                         if data.get("_skipme", False):
+                            entries_processed += 1
                             continue
-                        # Cut the recording into corresponding segment and discard audio data outside the segment.
-                        cut = make_cut_with_subset_inmemory_recording(
-                            recording, offset=data.get("offset", 0.0), duration=data.get("duration")
+
+                        # Construct URL: tar_path/audio_filename
+                        audio_url = f"{tar_path.rstrip('/')}/{audio_filename.lstrip('/')}"
+
+                        # Get metadata from manifest
+                        duration = data.get("duration")
+                        if duration is None:
+                            logging.warning(f"Skipping '{audio_filename}' - missing duration in manifest")
+                            entries_processed += 1
+                            continue
+
+                        offset = data.get("offset", 0.0)
+                        sampling_rate = data.get("sampling_rate", 16000)  # default to 16kHz if not specified
+
+                        # Create URL-based recording
+                        recording = Recording(
+                            id=audio_filename,
+                            sources=[AudioSource(type="url", channels=[0], source=audio_url)],
+                            sampling_rate=sampling_rate,
+                            num_samples=compute_num_samples(duration, sampling_rate),
+                            duration=duration,
                         )
+
+                        # Create cut from recording (audio will be loaded lazily from URL when needed)
+                        cut = recording.to_cut()
+                        if offset > 0:
+                            cut = cut.truncate(offset=offset, duration=duration, preserve_id=True)
+                            cut.id = f"{cut.id}-{round(offset * 1e2):06d}-{round(duration * 1e2):06d}"
+
+                        # Add supervision (transcript metadata)
                         cut.supervisions.append(
                             SupervisionSegment(
                                 id=cut.id,
@@ -459,19 +494,72 @@ class LazyNeMoTarredIterator:
                                 language=data.get(self.lang_field),
                             )
                         )
+
+                        # Attach custom fields and metadata
                         cut.custom = _to_custom_attr_dict(data)
                         cut.manifest_origin = manifest_path
                         cut.tar_origin = tar_path
                         for extra_field in extra_fields:
                             extra_field.attach_to(cut)
-                        cuts_for_recording.append(cut)
-                    del recording  # free the memory - helps with very large audio files
-                    del raw_audio
-                    yield from cuts_for_recording
-            except tarfile.ReadError:
-                logging.warning(
-                    f"Skipping tar file due to read errors (unstable storage or bad file?): {tar_path=}",
-                )
+
+                        cntr += 1
+                        entries_processed += 1
+                        yield cut
+
+                    # Break outer loop if we've reached the slice length limit
+                    if cntr == self.slice_length:
+                        break
+            else:
+                try:
+                    for data, raw_audio, tar_info in self._iter_sequential(
+                        tar_path, shard_manifest, manifest_path, rng
+                    ):
+                        try:
+                            meta = soundfile.info(BytesIO(raw_audio))
+                        except Exception:
+                            logging.warning(f"Skipped corrupted file '{tar_info.path}' in {tar_path=}.")
+                            continue
+                        recording = Recording(
+                            id=tar_info.path,
+                            sources=[
+                                AudioSource(type="memory", channels=list(range(meta.channels)), source=raw_audio)
+                            ],
+                            sampling_rate=int(meta.samplerate),
+                            num_samples=meta.frames,
+                            duration=meta.duration,
+                        )
+                        cuts_for_recording = []
+                        for data in shard_manifest[tar_info.name]:
+                            # filter out entries with valid "_skipme" values.
+                            if data.get("_skipme", False):
+                                continue
+                            # Cut the recording into corresponding segment and discard audio data outside the segment.
+                            cut = make_cut_with_subset_inmemory_recording(
+                                recording, offset=data.get("offset", 0.0), duration=data.get("duration")
+                            )
+                            cut.supervisions.append(
+                                SupervisionSegment(
+                                    id=cut.id,
+                                    recording_id=cut.recording_id,
+                                    start=0,
+                                    duration=cut.duration,
+                                    text=data.get(self.text_field),
+                                    language=data.get(self.lang_field),
+                                )
+                            )
+                            cut.custom = _to_custom_attr_dict(data)
+                            cut.manifest_origin = manifest_path
+                            cut.tar_origin = tar_path
+                            for extra_field in extra_fields:
+                                extra_field.attach_to(cut)
+                            cuts_for_recording.append(cut)
+                        del recording  # free the memory - helps with very large audio files
+                        del raw_audio
+                        yield from cuts_for_recording
+                except tarfile.ReadError:
+                    logging.warning(
+                        f"Skipping tar file due to read errors (unstable storage or bad file?): {tar_path=}",
+                    )
 
         self.epoch += 1
 
